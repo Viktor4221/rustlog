@@ -155,15 +155,16 @@ impl Bot {
         msg: ServerMessage,
         client: &TwitchClient<C>,
     ) -> anyhow::Result<()> {
-        // Track username changes from PRIVMSG before writing to ClickHouse.
-        // The IRC tags contain both user-id and login so no Helix call is needed.
         if let ServerMessage::Privmsg(privmsg) = &msg {
             trace!("Processing message {}", privmsg.message_text);
 
-            // Track username using the id and login directly from IRC tags.
-            self.app
-                .track_username(&privmsg.sender.id, &privmsg.sender.login)
-                .await;
+            // Only track usernames for users who have not opted out.
+            // opt_out is keyed by user_id, matching the check in write_message.
+            if !self.app.config.opt_out.contains_key(privmsg.sender.id.as_str()) {
+                self.app
+                    .track_username(&privmsg.sender.id, &privmsg.sender.login)
+                    .await;
+            }
 
             if let Some(cmd) = privmsg.message_text.strip_prefix(COMMAND_PREFIX) {
                 if let Err(err) = self
