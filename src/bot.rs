@@ -155,8 +155,16 @@ impl Bot {
         msg: ServerMessage,
         client: &TwitchClient<C>,
     ) -> anyhow::Result<()> {
+        // Track username changes from PRIVMSG before writing to ClickHouse.
+        // The IRC tags contain both user-id and login so no Helix call is needed.
         if let ServerMessage::Privmsg(privmsg) = &msg {
             trace!("Processing message {}", privmsg.message_text);
+
+            // Track username using the id and login directly from IRC tags.
+            self.app
+                .track_username(&privmsg.sender.id, &privmsg.sender.login)
+                .await;
+
             if let Some(cmd) = privmsg.message_text.strip_prefix(COMMAND_PREFIX) {
                 if let Err(err) = self
                     .handle_command(cmd, client, &privmsg.sender.id, &privmsg.sender.login)
