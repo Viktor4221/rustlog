@@ -8,9 +8,12 @@ use crate::{
     Result,
 };
 use anyhow::Context;
+use chrono::Utc;
+use dashmap::DashMap;
 use dashmap::DashSet;
+use sqlx::PgPool;
 use std::{collections::HashMap, sync::Arc};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use twitch_api::{helix::users::GetUsersRequest, twitch_oauth2::AppAccessToken, HelixClient};
 
 #[derive(Clone)]
@@ -22,9 +25,79 @@ pub struct App {
     pub db: Arc<clickhouse::Client>,
     pub config: Arc<Config>,
     pub flush_buffer: FlushBuffer,
+    pub pg: Arc<PgPool>,
+    /// In-memory map of user_id -> current username for change detection
+    pub username_cache: Arc<DashMap<String, String>>,
 }
 
 impl App {
+    /// Called on every chat message. Checks if the username has changed since we
+    /// last saw this user and, if so, upserts the `usernames` table and appends a
+    /// row to `username_history`. All Postgres errors are logged but never
+    /// propagated — a DB hiccup must never affect the main logging pipeline.
+    pub async fn track_username(&self, user_id: &str, username: &str) {
+        // Fast path: username unchanged since last message — nothing to do.
+        if let Some(cached) = self.username_cache.get(user_id) {
+            if cached.value() == username {
+                return;
+            }
+        }
+
+        // Either first time we see this user, or username changed.
+        // Upsert into `usernames` and capture the previous value (if any).
+        let result: Result<Option<String>, _> = sqlx::query_scalar(
+            r#"
+            INSERT INTO usernames (user_id, username)
+            VALUES ($1::int4, $2)
+            ON CONFLICT (user_id) DO UPDATE
+                SET username = EXCLUDED.username
+                WHERE usernames.username IS DISTINCT FROM EXCLUDED.username
+            RETURNING (SELECT username FROM usernames WHERE user_id = $1::int4)
+            "#,
+        )
+        .bind(user_id.parse::<i32>().unwrap_or(0))
+        .bind(username)
+        .fetch_optional(&*self.pg)
+        .await;
+
+        match result {
+            Err(e) => {
+                error!("Postgres upsert failed for user {user_id}: {e}");
+                return;
+            }
+            Ok(maybe_old) => {
+                // `maybe_old` is Some(old_username) when the UPDATE branch fired
+                // (i.e. the username actually changed), None on a fresh INSERT.
+                if let Some(old_username) = maybe_old {
+                    let ts = Utc::now().timestamp_millis();
+                    if let Err(e) = sqlx::query(
+                        r#"
+                        INSERT INTO username_history (user_id, ts, old_username, new_username)
+                        VALUES ($1::int4, $2, $3, $4)
+                        "#,
+                    )
+                    .bind(user_id.parse::<i32>().unwrap_or(0))
+                    .bind(ts)
+                    .bind(&old_username)
+                    .bind(username)
+                    .execute(&*self.pg)
+                    .await
+                    {
+                        error!("Postgres history insert failed for user {user_id}: {e}");
+                    } else {
+                        info!(
+                            "Username change detected: {user_id} {old_username} -> {username}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Update the in-memory cache regardless of whether it was an INSERT or UPDATE.
+        self.username_cache
+            .insert(user_id.to_owned(), username.to_owned());
+    }
+
     pub async fn get_users(
         &self,
         ids: Vec<String>,
