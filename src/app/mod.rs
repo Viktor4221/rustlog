@@ -43,19 +43,41 @@ impl App {
             }
         }
 
-        // Either first time we see this user, or username changed.
-        // Upsert into `usernames` and capture the previous value (if any).
-        let result: Result<Option<String>, _> = sqlx::query_scalar(
+        // Parse user_id as i64 to avoid i32 overflow on large Twitch IDs.
+        // Postgres will enforce the int4 constraint and error loudly rather than
+        // silently corrupting data.
+        let uid: i64 = match user_id.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Could not parse user_id {user_id:?} as integer: {e}");
+                return;
+            }
+        };
+
+        // Capture the old username *before* overwriting it, then do the upsert.
+        // The CTE `old` snapshots the current row; the UPDATE only fires when the
+        // username actually differs; RETURNING gives us the pre-update value so we
+        // can tell whether a real change happened.
+        //
+        // Row is returned when:
+        //   - INSERT (new user)  -> old_username is NULL
+        //   - UPDATE (changed)   -> old_username is the previous value
+        // No row is returned when the ON CONFLICT ... WHERE clause is false
+        // (username identical) because postgres skips the UPDATE entirely.
+        let result: std::result::Result<Option<Option<String>>, sqlx::Error> = sqlx::query_scalar(
             r#"
+            WITH old AS (
+                SELECT username FROM usernames WHERE user_id = $1::int4
+            )
             INSERT INTO usernames (user_id, username)
             VALUES ($1::int4, $2)
             ON CONFLICT (user_id) DO UPDATE
                 SET username = EXCLUDED.username
                 WHERE usernames.username IS DISTINCT FROM EXCLUDED.username
-            RETURNING (SELECT username FROM usernames WHERE user_id = $1::int4)
+            RETURNING (SELECT username FROM old)
             "#,
         )
-        .bind(user_id.parse::<i32>().unwrap_or(0))
+        .bind(uid)
         .bind(username)
         .fetch_optional(&*self.pg)
         .await;
@@ -65,10 +87,12 @@ impl App {
                 error!("Postgres upsert failed for user {user_id}: {e}");
                 return;
             }
-            Ok(maybe_old) => {
-                // `maybe_old` is Some(old_username) when the UPDATE branch fired
-                // (i.e. the username actually changed), None on a fresh INSERT.
-                if let Some(old_username) = maybe_old {
+            // No row returned = username was identical, nothing changed.
+            Ok(None) => {}
+            // Row returned = INSERT (old_username is None) or UPDATE (old_username is Some).
+            Ok(Some(maybe_old_username)) => {
+                if let Some(old_username) = maybe_old_username {
+                    // Username changed — write history record.
                     let ts = Utc::now().timestamp_millis();
                     if let Err(e) = sqlx::query(
                         r#"
@@ -76,7 +100,7 @@ impl App {
                         VALUES ($1::int4, $2, $3, $4)
                         "#,
                     )
-                    .bind(user_id.parse::<i32>().unwrap_or(0))
+                    .bind(uid)
                     .bind(ts)
                     .bind(&old_username)
                     .bind(username)
@@ -85,15 +109,14 @@ impl App {
                     {
                         error!("Postgres history insert failed for user {user_id}: {e}");
                     } else {
-                        info!(
-                            "Username change detected: {user_id} {old_username} -> {username}"
-                        );
+                        info!("Username change: {user_id} {old_username} -> {username}");
                     }
                 }
+                // Fresh INSERT (maybe_old_username was None): no history row needed.
             }
         }
 
-        // Update the in-memory cache regardless of whether it was an INSERT or UPDATE.
+        // Update the in-memory cache so the next message skips Postgres entirely.
         self.username_cache
             .insert(user_id.to_owned(), username.to_owned());
     }
