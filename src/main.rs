@@ -21,7 +21,7 @@ use db::{setup_db, writer::create_writer};
 use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt};
 use migrator::Migrator;
 use mimalloc::MiMalloc;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::{
     env,
     sync::Arc,
@@ -103,13 +103,19 @@ async fn run(config: Config, db: clickhouse::Client) -> anyhow::Result<()> {
     )
     .await?;
 
-    let pg_url = format!(
-        "postgres://{}:{}@localhost:5432/twitch_chat",
-        config.psql_user, config.psql_pass
-    );
+    // Use PgConnectOptions so credentials with special characters (@, /, #, etc.)
+    // are passed as discrete fields rather than being interpolated into a URL,
+    // which would silently produce an invalid connection string.
+    let pg_opts = PgConnectOptions::new()
+        .host("localhost")
+        .port(5432)
+        .database("twitch_chat")
+        .username(&config.psql_user)
+        .password(&config.psql_pass);
+
     let pg = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&pg_url)
+        .connect_with(pg_opts)
         .await
         .context("Could not connect to Postgres")?;
     info!("Connected to Postgres");
