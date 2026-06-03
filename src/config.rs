@@ -25,6 +25,8 @@ pub struct Config {
     pub opt_out: DashMap<String, bool>,
     #[serde(rename = "adminAPIKey")]
     pub admin_api_key: Option<String>,
+    pub psql_user: String,
+    pub psql_pass: String,
     #[serde(skip)]
     config_path: Option<std::path::PathBuf>,
 }
