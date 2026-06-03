@@ -38,6 +38,11 @@ schemars = { version = "0.9", features = ["chrono04"] }
 serde = { version = "1.0.188", features = ["derive"] }
 serde_json = { version = "1.0.105", features = ["preserve_order"] }
 serde_repr = "0.1.16"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+] }
 strum = { version = "0.26.2", features = ["derive"] }
 thiserror = "1.0.47"
 tokio = { version = "1.32.0", features = ["sync", "signal", "rt-multi-thread"] }
