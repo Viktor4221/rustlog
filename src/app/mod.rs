@@ -44,8 +44,7 @@ impl App {
             Ok(rows) => {
                 let count = rows.len();
                 for (user_id, username) in rows {
-                    self.username_cache
-                        .insert(user_id.to_string(), username);
+                    self.username_cache.insert(user_id.to_string(), username);
                 }
                 info!("Seeded username_cache with {count} entries from Postgres");
             }
@@ -76,30 +75,41 @@ impl App {
             }
         };
 
-        // Upsert the `usernames` table.
+        // Upsert the `usernames` table, capturing the old username atomically
+        // in a CTE so no separate round-trip is needed and no rename can be
+        // lost even after a restart.
         //
-        // We use `(xmax = 0) AS inserted` to distinguish a fresh INSERT from
-        // an UPDATE in a portable, unambiguous way:
-        //   inserted = true  => the row did not exist before (new user).
-        //   inserted = false => the row existed and was updated (name change).
+        // The CTE reads the existing row *before* the INSERT/UPDATE runs.
+        // RETURNING then gives us:
+        //   inserted    = true  → fresh INSERT (new user, no history row needed)
+        //   inserted    = false → UPDATE (name changed, write history row)
+        //   old_username        → the name that was in the table before this
+        //                         upsert; NULL when the row did not exist yet
         //
-        // The WHERE clause on DO UPDATE means no write — and therefore no
-        // RETURNING row — happens when the username is already identical in the
-        // DB, so `fetch_optional` correctly returns None in that case.
-        let result: std::result::Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
-            r#"
-            INSERT INTO usernames (user_id, username)
-            VALUES ($1::int4, $2)
-            ON CONFLICT (user_id) DO UPDATE
-                SET username = EXCLUDED.username
-                WHERE usernames.username IS DISTINCT FROM EXCLUDED.username
-            RETURNING (xmax = 0) AS inserted
-            "#,
-        )
-        .bind(uid)
-        .bind(username)
-        .fetch_optional(&*self.pg)
-        .await;
+        // The WHERE clause on DO UPDATE prevents any write — and therefore any
+        // RETURNING row — when the username is already identical in the DB.
+        let result: std::result::Result<Option<(bool, Option<String>)>, sqlx::Error> =
+            sqlx::query_as(
+                r#"
+                WITH old AS (
+                    SELECT username AS old_username
+                    FROM usernames
+                    WHERE user_id = $1::int4
+                )
+                INSERT INTO usernames (user_id, username)
+                VALUES ($1::int4, $2)
+                ON CONFLICT (user_id) DO UPDATE
+                    SET username = EXCLUDED.username
+                    WHERE usernames.username IS DISTINCT FROM EXCLUDED.username
+                RETURNING
+                    (xmax = 0)                        AS inserted,
+                    (SELECT old_username FROM old)    AS old_username
+                "#,
+            )
+            .bind(uid)
+            .bind(username)
+            .fetch_optional(&*self.pg)
+            .await;
 
         match result {
             Err(e) => {
@@ -108,67 +118,21 @@ impl App {
                 // retry the DB write rather than silently skipping it.
             }
             // No row returned: username was already identical in the DB.
-            // Sync the in-memory cache in case it was stale (e.g. after a
-            // restart where the cache was pre-seeded but a concurrent write
-            // landed between seed and this message).
+            // Sync the in-memory cache in case it was stale.
             Ok(None) => {
                 self.username_cache
                     .insert(user_id.to_owned(), username.to_owned());
             }
-            Ok(Some(inserted)) => {
-                if inserted {
-                    // Brand-new user — just record them in the cache.
-                    self.username_cache
-                        .insert(user_id.to_owned(), username.to_owned());
-                } else {
-                    // Existing user whose username changed.
-                    //
-                    // Read the old username from the in-memory cache *before*
-                    // overwriting it so we can write the history row.
-                    // `DashMap::insert` returns the previous value atomically.
-                    let old_username_cached = self
-                        .username_cache
-                        .insert(user_id.to_owned(), username.to_owned());
+            Ok(Some((inserted, old_username))) => {
+                // Update cache after a confirmed successful DB write.
+                self.username_cache
+                    .insert(user_id.to_owned(), username.to_owned());
 
-                    // Determine the old username. Normally it comes from the
-                    // in-memory cache. After a restart the cache was pre-seeded
-                    // from the DB, so it should almost always be present. As a
-                    // last-resort fallback we query the DB for the row that
-                    // existed *just before* our upsert — this is safe because
-                    // the upsert already wrote the new username, so we look for
-                    // any history row or we accept that on a brand-new install
-                    // there may be no old name to record.
-                    //
-                    // In practice, because we seed the cache at startup, this
-                    // fallback path is only reached if the DB was written to
-                    // by another process between the seed and the first message
-                    // from this user.
-                    let old_username: Option<String> = match old_username_cached {
-                        Some(old) => Some(old),
-                        None => {
-                            // Fall back: fetch the most recent previous entry
-                            // from username_history so we don't lose the rename.
-                            sqlx::query_scalar(
-                                r#"
-                                SELECT new_username
-                                FROM username_history
-                                WHERE user_id = $1::int4
-                                ORDER BY ts DESC
-                                LIMIT 1
-                                "#,
-                            )
-                            .bind(uid)
-                            .fetch_optional(&*self.pg)
-                            .await
-                            .unwrap_or_else(|e| {
-                                error!(
-                                    "Could not fetch previous username for {user_id}: {e}"
-                                );
-                                None
-                            })
-                        }
-                    };
-
+                if !inserted {
+                    // Row existed and was updated — real name change.
+                    // old_username comes from the CTE and is the value that was
+                    // in the DB before our upsert, so it is always accurate
+                    // regardless of whether the in-memory cache was populated.
                     if let Some(old) = old_username {
                         let ts = Utc::now().timestamp_millis();
                         if let Err(e) = sqlx::query(
@@ -190,6 +154,7 @@ impl App {
                         }
                     }
                 }
+                // inserted = true: brand-new user, no history row needed.
             }
         }
     }
