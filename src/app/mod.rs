@@ -43,7 +43,8 @@ impl App {
             }
         }
 
-        let uid: i64 = match user_id.parse() {
+        // Bug 1 fix: user_id column is int4; parse as i32 to match.
+        let uid: i32 = match user_id.parse() {
             Ok(v) => v,
             Err(e) => {
                 error!("Could not parse user_id {user_id:?} as integer: {e}");
@@ -51,42 +52,34 @@ impl App {
             }
         };
 
-        // Atomically claim this update in the in-memory cache before touching
-        // Postgres. DashMap::insert returns the previous value. If another
-        // concurrent task already raced ahead and inserted the same username,
-        // the returned old value will equal `username` — bail out so only one
-        // task performs the DB writes.
-        // This also ensures the cache is always updated even when the DB call
-        // below fails, preventing log spam on every subsequent message.
-        let previous_cached = self
-            .username_cache
-            .insert(user_id.to_owned(), username.to_owned());
-        if previous_cached.as_deref() == Some(username) {
-            // Another concurrent call already handled this transition.
-            return;
-        }
-
-        // Capture the old username *before* overwriting it, then do the upsert.
-        // The CTE `old` snapshots the current row; the UPDATE only fires when the
-        // username actually differs; RETURNING gives us the pre-update value so we
-        // can tell whether a real change happened.
+        // Bug 4 fix: use xmax to distinguish INSERT from UPDATE unambiguously.
         //
-        // Row is returned when:
-        //   - INSERT (new user)  -> old_username is NULL
-        //   - UPDATE (changed)   -> old_username is the previous value
-        // No row is returned when the ON CONFLICT ... WHERE clause is false
-        // (username identical) because postgres skips the UPDATE entirely.
-        let result: std::result::Result<Option<Option<String>>, sqlx::Error> = sqlx::query_scalar(
+        // xmax = 0  => the row was freshly inserted (new user).
+        // xmax != 0 => the row already existed and was updated (username change).
+        //
+        // The WHERE clause on DO UPDATE prevents a no-op update when the username
+        // is already identical, so if a row is returned with xmax != 0 we know
+        // the username genuinely changed.
+        //
+        // We also capture the old username via a sub-select inside RETURNING so
+        // we can record it in the history table without a separate round-trip.
+        // The sub-select runs *after* the update, but because we only reach the
+        // UPDATE branch when the username IS DISTINCT, the sub-select will
+        // return the new (just-written) value — so we pass `old_username` from
+        // the Rust side via the previous cache entry instead (see below).
+        //
+        // Actually: RETURNING sub-selects see the post-update state of the table,
+        // so to get the *old* username we read it from our in-memory cache, which
+        // still holds the previous value at this point (Bug 2 fix: cache is only
+        // updated after a successful DB write).
+        let result: std::result::Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
             r#"
-            WITH old AS (
-                SELECT username FROM usernames WHERE user_id = $1::int8
-            )
             INSERT INTO usernames (user_id, username)
-            VALUES ($1::int8, $2)
+            VALUES ($1::int4, $2)
             ON CONFLICT (user_id) DO UPDATE
                 SET username = EXCLUDED.username
                 WHERE usernames.username IS DISTINCT FROM EXCLUDED.username
-            RETURNING (SELECT username FROM old)
+            RETURNING xmax::text::bigint
             "#,
         )
         .bind(uid)
@@ -97,38 +90,52 @@ impl App {
         match result {
             Err(e) => {
                 error!("Postgres upsert failed for user {user_id}: {e}");
-                // The in-memory cache was already updated above. We intentionally
-                // do not revert it: the next username *change* will trigger a
-                // fresh DB attempt, while repeated messages with the same username
-                // are silently skipped. This avoids hammering a broken DB on every
-                // single message from a busy user.
+                // Bug 2 fix: do NOT update the cache on failure. The cache still
+                // holds the previous value (or nothing), so the next message from
+                // this user will re-attempt the DB write rather than silently
+                // skipping it due to a stale cache hit.
             }
-            // No row returned = username was identical in DB, nothing changed.
-            Ok(None) => {}
-            // Row returned = INSERT (old_username is None) or UPDATE (old_username is Some).
-            Ok(Some(maybe_old_username)) => {
-                if let Some(old_username) = maybe_old_username {
-                    // Username changed — write history record.
-                    let ts = Utc::now().timestamp_millis();
-                    if let Err(e) = sqlx::query(
-                        r#"
-                        INSERT INTO username_history (user_id, ts, old_username, new_username)
-                        VALUES ($1::int8, $2::int8, $3, $4)
-                        "#,
-                    )
-                    .bind(uid)
-                    .bind(ts)
-                    .bind(&old_username)
-                    .bind(username)
-                    .execute(&*self.pg)
-                    .await
-                    {
-                        error!("Postgres history insert failed for user {user_id}: {e}");
-                    } else {
-                        info!("Username change: {user_id} {old_username} -> {username}");
+            // No row returned = username was already identical in the DB; sync cache.
+            Ok(None) => {
+                self.username_cache
+                    .insert(user_id.to_owned(), username.to_owned());
+            }
+            Ok(Some(xmax)) => {
+                // Bug 2 fix: cache is only updated here, after a confirmed
+                // successful DB write.
+                // Read the old username from the cache *before* overwriting it —
+                // it still holds the previous value because we deferred the update.
+                let old_username = self
+                    .username_cache
+                    .insert(user_id.to_owned(), username.to_owned());
+
+                if xmax != 0 {
+                    // xmax != 0: the row existed and was updated — real name change.
+                    // old_username is what was in the cache before; if the cache had
+                    // no entry yet (first run after restart) we fall back to None and
+                    // skip the history row rather than recording a spurious change.
+                    if let Some(old) = old_username {
+                        let ts = Utc::now().timestamp_millis();
+                        if let Err(e) = sqlx::query(
+                            r#"
+                            INSERT INTO username_history (user_id, ts, old_username, new_username)
+                            VALUES ($1::int4, $2::int8, $3, $4)
+                            "#,
+                        )
+                        .bind(uid)
+                        .bind(ts)
+                        .bind(&old)
+                        .bind(username)
+                        .execute(&*self.pg)
+                        .await
+                        {
+                            error!("Postgres history insert failed for user {user_id}: {e}");
+                        } else {
+                            info!("Username change: {user_id} {old} -> {username}");
+                        }
                     }
                 }
-                // Fresh INSERT (maybe_old_username was None): no history row needed.
+                // xmax == 0: fresh INSERT (new user) — no history row needed.
             }
         }
     }
