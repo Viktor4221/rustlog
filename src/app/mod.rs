@@ -37,14 +37,16 @@ impl App {
     /// Pre-seed `username_cache` from the `usernames` Postgres table.
     /// Call once at startup, before the bot begins processing messages.
     pub async fn seed_username_cache(&self) {
-        match sqlx::query_as::<_, (i32, String)>("SELECT user_id, username FROM usernames")
-            .fetch_all(&*self.pg)
-            .await
+        match sqlx::query_as::<_, (String, String)>(
+            "SELECT user_id::text, username FROM usernames",
+        )
+        .fetch_all(&*self.pg)
+        .await
         {
             Ok(rows) => {
                 let count = rows.len();
                 for (user_id, username) in rows {
-                    self.username_cache.insert(user_id.to_string(), username);
+                    self.username_cache.insert(user_id, username);
                 }
                 info!("Seeded username_cache with {count} entries from Postgres");
             }
@@ -80,15 +82,13 @@ impl App {
         // lost even after a restart.
         //
         // The CTE reads the existing row *before* the INSERT/UPDATE runs.
-        // RETURNING then gives us:
-        //   inserted    = true  → fresh INSERT (new user, no history row needed)
-        //   inserted    = false → UPDATE (name changed, write history row)
-        //   old_username        → the name that was in the table before this
-        //                         upsert; NULL when the row did not exist yet
-        //
         // The WHERE clause on DO UPDATE prevents any write — and therefore any
         // RETURNING row — when the username is already identical in the DB.
-        let result: std::result::Result<Option<(bool, Option<String>)>, sqlx::Error> =
+        //
+        // What RETURNING tells us:
+        //   old_username = NULL  → fresh INSERT (new user, no history row needed)
+        //   old_username = Some  → UPDATE (name changed, write history row)
+        let result: std::result::Result<Option<(Option<String>,)>, sqlx::Error> =
             sqlx::query_as(
                 r#"
                 WITH old AS (
@@ -102,8 +102,7 @@ impl App {
                     SET username = EXCLUDED.username
                     WHERE usernames.username IS DISTINCT FROM EXCLUDED.username
                 RETURNING
-                    (xmax = 0)                        AS inserted,
-                    (SELECT old_username FROM old)    AS old_username
+                    (SELECT old_username FROM old) AS old_username
                 "#,
             )
             .bind(uid)
@@ -123,38 +122,33 @@ impl App {
                 self.username_cache
                     .insert(user_id.to_owned(), username.to_owned());
             }
-            Ok(Some((inserted, old_username))) => {
+            Ok(Some((old_username,))) => {
                 // Update cache after a confirmed successful DB write.
                 self.username_cache
                     .insert(user_id.to_owned(), username.to_owned());
 
-                if !inserted {
-                    // Row existed and was updated — real name change.
-                    // old_username comes from the CTE and is the value that was
-                    // in the DB before our upsert, so it is always accurate
-                    // regardless of whether the in-memory cache was populated.
-                    if let Some(old) = old_username {
-                        let ts = Utc::now().timestamp_millis();
-                        if let Err(e) = sqlx::query(
-                            r#"
-                            INSERT INTO username_history (user_id, ts, old_username, new_username)
-                            VALUES ($1::int4, $2::int8, $3, $4)
-                            "#,
-                        )
-                        .bind(uid)
-                        .bind(ts)
-                        .bind(&old)
-                        .bind(username)
-                        .execute(&*self.pg)
-                        .await
-                        {
-                            error!("Postgres history insert failed for user {user_id}: {e}");
-                        } else {
-                            info!("Username change: {user_id} {old} -> {username}");
-                        }
+                if let Some(old) = old_username {
+                    // old_username is Some → row existed and was updated — real name change.
+                    let ts = Utc::now().timestamp_millis();
+                    if let Err(e) = sqlx::query(
+                        r#"
+                        INSERT INTO username_history (user_id, ts, old_username, new_username)
+                        VALUES ($1::int4, $2::int8, $3, $4)
+                        "#,
+                    )
+                    .bind(uid)
+                    .bind(ts)
+                    .bind(&old)
+                    .bind(username)
+                    .execute(&*self.pg)
+                    .await
+                    {
+                        error!("Postgres history insert failed for user {user_id}: {e}");
+                    } else {
+                        info!("Username change: {user_id} {old} -> {username}");
                     }
                 }
-                // inserted = true: brand-new user, no history row needed.
+                // old_username is None → brand-new user, no history row needed.
             }
         }
     }
