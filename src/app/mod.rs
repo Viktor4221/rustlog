@@ -43,9 +43,6 @@ impl App {
             }
         }
 
-        // Parse user_id as i64 to avoid i32 overflow on large Twitch IDs.
-        // Postgres will enforce the int4 constraint and error loudly rather than
-        // silently corrupting data.
         let uid: i64 = match user_id.parse() {
             Ok(v) => v,
             Err(e) => {
@@ -53,6 +50,21 @@ impl App {
                 return;
             }
         };
+
+        // Atomically claim this update in the in-memory cache before touching
+        // Postgres. DashMap::insert returns the previous value. If another
+        // concurrent task already raced ahead and inserted the same username,
+        // the returned old value will equal `username` — bail out so only one
+        // task performs the DB writes.
+        // This also ensures the cache is always updated even when the DB call
+        // below fails, preventing log spam on every subsequent message.
+        let previous_cached = self
+            .username_cache
+            .insert(user_id.to_owned(), username.to_owned());
+        if previous_cached.as_deref() == Some(username) {
+            // Another concurrent call already handled this transition.
+            return;
+        }
 
         // Capture the old username *before* overwriting it, then do the upsert.
         // The CTE `old` snapshots the current row; the UPDATE only fires when the
@@ -67,10 +79,10 @@ impl App {
         let result: std::result::Result<Option<Option<String>>, sqlx::Error> = sqlx::query_scalar(
             r#"
             WITH old AS (
-                SELECT username FROM usernames WHERE user_id = $1::int4
+                SELECT username FROM usernames WHERE user_id = $1::int8
             )
             INSERT INTO usernames (user_id, username)
-            VALUES ($1::int4, $2)
+            VALUES ($1::int8, $2)
             ON CONFLICT (user_id) DO UPDATE
                 SET username = EXCLUDED.username
                 WHERE usernames.username IS DISTINCT FROM EXCLUDED.username
@@ -85,9 +97,13 @@ impl App {
         match result {
             Err(e) => {
                 error!("Postgres upsert failed for user {user_id}: {e}");
-                return;
+                // The in-memory cache was already updated above. We intentionally
+                // do not revert it: the next username *change* will trigger a
+                // fresh DB attempt, while repeated messages with the same username
+                // are silently skipped. This avoids hammering a broken DB on every
+                // single message from a busy user.
             }
-            // No row returned = username was identical, nothing changed.
+            // No row returned = username was identical in DB, nothing changed.
             Ok(None) => {}
             // Row returned = INSERT (old_username is None) or UPDATE (old_username is Some).
             Ok(Some(maybe_old_username)) => {
@@ -97,7 +113,7 @@ impl App {
                     if let Err(e) = sqlx::query(
                         r#"
                         INSERT INTO username_history (user_id, ts, old_username, new_username)
-                        VALUES ($1::int4, $2, $3, $4)
+                        VALUES ($1::int8, $2::int8, $3, $4)
                         "#,
                     )
                     .bind(uid)
@@ -115,10 +131,6 @@ impl App {
                 // Fresh INSERT (maybe_old_username was None): no history row needed.
             }
         }
-
-        // Update the in-memory cache so the next message skips Postgres entirely.
-        self.username_cache
-            .insert(user_id.to_owned(), username.to_owned());
     }
 
     pub async fn get_users(
