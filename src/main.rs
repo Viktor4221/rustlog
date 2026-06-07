@@ -132,6 +132,11 @@ async fn run(config: Config, db: clickhouse::Client) -> anyhow::Result<()> {
         username_cache: Arc::new(DashMap::new()),
     };
 
+    // Seed the in-memory username cache from Postgres before the bot starts
+    // processing messages. This ensures that any rename which occurs on the
+    // very first message after a restart is detected and recorded correctly.
+    app.seed_username_cache().await;
+
     let (bot_tx, bot_rx) = mpsc::channel(1);
 
     let login_credentials = StaticLoginCredentials::anonymous();
